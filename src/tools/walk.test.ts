@@ -6,7 +6,7 @@ import type { CommitId, RelPath } from '../terms.ts'
 import { loadView } from '../view/view.ts'
 import { createToolHost } from './host.ts'
 import { createRoots } from '../roots/roots.ts'
-import { createCachedWalk, createCachedWalkDetailed } from './walk.ts'
+import { createCachedWalkDetailed } from './walk.ts'
 
 function row(name: string, kind: EntryKind = 'file'): DirEntry {
   return { name, kind, mode: kind === 'dir' ? 0o40000 : 0o100644, size: 0, id: '' }
@@ -23,9 +23,19 @@ function fakeView(tree: Record<string, DirEntry[]>) {
 }
 const limits = { maxDepth: 24, maxRows: 5000 }
 
+/**
+ * 这一份测试里的"只要路径"读法。**不是产品的一个口**：产品只有
+ * `createCachedWalkDetailed`，`host.ts` 自己内联 `(await walkDetailed()).paths`
+ * ——原先 `walk.ts` 另外导出了一个同样内容的 `createCachedWalk`，而除了这个文件没有一处用它。
+ */
+function pathsOf(view: Parameters<typeof createCachedWalkDetailed>[0], ls: typeof limits): () => Promise<readonly string[]> {
+  const detailed = createCachedWalkDetailed(view, ls)
+  return async () => (await detailed()).paths
+}
+
 test('same-generation walks share traversal and return independent arrays', async () => {
   const view = fakeView({ '': [row('a'), row('d', 'dir')], d: [row('b')] })
-  const walk = createCachedWalk(view, limits)
+  const walk = pathsOf(view, limits)
   const [first, concurrent] = await Promise.all([walk(), walk()])
   assert.deepEqual(first, ['a', 'd/b'])
   assert.deepEqual(concurrent, first)
@@ -38,7 +48,7 @@ test('same-generation walks share traversal and return independent arrays', asyn
 test('revision/base changes invalidate; independent walkers do not share state', async () => {
   const tree = { '': [row('a')] }
   const view = fakeView(tree)
-  const walk = createCachedWalk(view, limits)
+  const walk = pathsOf(view, limits)
   assert.deepEqual(await walk(), ['a'])
   tree[''] = [row('b')]
   view.rev++
@@ -46,7 +56,7 @@ test('revision/base changes invalidate; independent walkers do not share state',
   tree[''] = [row('c')]
   view.base = 'new-base'
   assert.deepEqual(await walk(), ['c'])
-  assert.deepEqual(await createCachedWalk(view, limits)(), ['c'])
+  assert.deepEqual(await pathsOf(view, limits)(), ['c'])
   assert.equal(view.listed.length, 4)
 })
 
@@ -57,11 +67,11 @@ test('cached traversal preserves row order, depth/row bounds and no-follow behav
     'd/nested': [row('too-deep')],
     link: [row('outside')],
   })
-  const walk = createCachedWalk(view, { maxDepth: 1, maxRows: 2 })
+  const walk = pathsOf(view, { maxDepth: 1, maxRows: 2 })
   assert.deepEqual(await walk(), ['d/first', 'd/second'])
   assert.deepEqual(await walk(), ['d/first', 'd/second'])
   assert.deepEqual(view.listed, ['', 'd'])
-  assert.deepEqual(await createCachedWalk(view, { maxDepth: 0, maxRows: 5 })(), ['last'])
+  assert.deepEqual(await pathsOf(view, { maxDepth: 0, maxRows: 5 })(), ['last'])
 })
 
 test('failed enumeration is retried instead of poisoning a generation', async () => {
@@ -70,7 +80,7 @@ test('failed enumeration is retried instead of poisoning a generation', async ()
     if (++attempts === 1) throw new Error('temporary list failure')
     return [row('recovered')]
   } }
-  const walk = createCachedWalk(view, limits)
+  const walk = pathsOf(view, limits)
   await assert.rejects(walk(), /temporary list failure/)
   assert.deepEqual(await walk(), ['recovered'])
   assert.deepEqual(await walk(), ['recovered'])
@@ -85,7 +95,7 @@ test('a generation changed during traversal is not reused', async () => {
     if (++calls === 1) await waiting
     return [row(`generation-${view.rev}`)]
   } }
-  const walk = createCachedWalk(view, limits)
+  const walk = pathsOf(view, limits)
   const old = walk()
   view.rev = 1
   release()
@@ -103,7 +113,7 @@ test('late old success/failure cannot discard a newer cached generation', async 
       if (++calls === 1) { await waiting; if (fail) throw new Error('old failure') }
       return [row(`generation-${view.rev}`)]
     } }
-    const walk = createCachedWalk(view, limits)
+    const walk = pathsOf(view, limits)
     const old = walk()
     view.rev = 1
     assert.deepEqual(await walk(), ['generation-1'])
